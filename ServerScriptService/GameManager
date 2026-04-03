@@ -1,0 +1,257 @@
+-- GameManager (Script)
+-- Place in: ServerScriptService
+-- Controls round states: Lobby -> Playing -> Win/Lose -> Lobby
+
+local Players         = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerStorage   = game:GetService("ServerStorage")
+local RunService      = game:GetService("RunService")
+
+local Config = require(ReplicatedStorage:WaitForChild("GameConfig"))
+
+-- Wait for RemoteEvents to exist
+local function getEvent(name) return ReplicatedStorage:WaitForChild(name, 10) end
+local GameStateChanged  = getEvent("GameStateChanged")
+local UpdateTimer       = getEvent("UpdateTimer")
+local PlayerCaught      = getEvent("PlayerCaught")
+local PlayerEscaped     = getEvent("PlayerEscaped")
+
+-- Game state
+local State = {
+    phase       = "Lobby",   -- "Lobby" | "Playing" | "Win" | "Lose"
+    timeLeft    = Config.LOBBY_WAIT_TIME,
+    escaped     = {},        -- player names who escaped
+    caught      = {},        -- player names who were caught
+    alive       = {},        -- players currently alive (not caught)
+    objectivesDone = 0,
+    exitUnlocked = false,
+}
+
+-- Utility: broadcast state to all clients
+local function broadcastState(phase, time)
+    GameStateChanged:FireAllClients(phase, time or 0)
+end
+
+-- Utility: move all players to a SpawnLocation named "LobbySpawn" or "GameSpawn"
+local function teleportAll(spawnName)
+    local spawn = workspace:FindFirstChild(spawnName, true)
+    if not spawn then
+        warn("[GameManager] Spawn '" .. spawnName .. "' not found in workspace.")
+        return
+    end
+    for _, player in pairs(Players:GetPlayers()) do
+        local char = player.Character
+        if char and char:FindFirstChild("HumanoidRootPart") then
+            char.HumanoidRootPart.CFrame = spawn.CFrame + Vector3.new(0, 3, 0)
+        end
+    end
+end
+
+-- Utility: reset player (restore health, speed, etc.)
+local function resetPlayer(player)
+    local char = player.Character
+    if not char then return end
+    local hum = char:FindFirstChild("Humanoid")
+    if hum then
+        hum.Health = hum.MaxHealth
+        hum.WalkSpeed = Config.PLAYER_WALK_SPEED
+    end
+end
+
+-- ─────────────────────────────────────────────
+-- LOBBY PHASE
+-- ─────────────────────────────────────────────
+local function runLobby()
+    State.phase         = "Lobby"
+    State.escaped       = {}
+    State.caught        = {}
+    State.alive         = {}
+    State.objectivesDone = 0
+    State.exitUnlocked  = false
+    State.timeLeft      = Config.LOBBY_WAIT_TIME
+
+    teleportAll("LobbySpawn")
+
+    print("[GameManager] Lobby phase started. Waiting for players...")
+
+    while State.timeLeft > 0 do
+        if #Players:GetPlayers() < Config.MIN_PLAYERS then
+            State.timeLeft = Config.LOBBY_WAIT_TIME  -- reset timer if not enough players
+        end
+        broadcastState("Lobby", State.timeLeft)
+        UpdateTimer:FireAllClients(State.timeLeft)
+        task.wait(1)
+        State.timeLeft -= 1
+    end
+end
+
+-- ─────────────────────────────────────────────
+-- PLAYING PHASE
+-- ─────────────────────────────────────────────
+local function runGame()
+    State.phase     = "Playing"
+    State.timeLeft  = Config.ROUND_DURATION
+
+    -- Populate alive list
+    State.alive = {}
+    for _, player in pairs(Players:GetPlayers()) do
+        table.insert(State.alive, player)
+        resetPlayer(player)
+    end
+
+    teleportAll("GameSpawn")
+    task.wait(2)    -- brief buffer before round starts
+
+    broadcastState("Playing", State.timeLeft)
+    print("[GameManager] Round started! Players: " .. #State.alive)
+
+    -- Notify ObjectiveManager to set up objectives
+    local objEvent = ReplicatedStorage:FindFirstChild("ObjectiveSetup")
+    if objEvent then objEvent:Fire(Config.OBJECTIVES_REQUIRED) end
+
+    -- Notify MonsterAI to activate
+    local monsterEvent = ReplicatedStorage:FindFirstChild("ActivateMonster")
+    if monsterEvent then monsterEvent:Fire() end
+
+    -- Main game tick
+    while State.timeLeft > 0 do
+        task.wait(1)
+        State.timeLeft -= 1
+        UpdateTimer:FireAllClients(State.timeLeft)
+
+        -- Check win: everyone escaped
+        local allEscaped = true
+        for _, player in pairs(Players:GetPlayers()) do
+            local escaped = false
+            for _, name in pairs(State.escaped) do
+                if name == player.Name then escaped = true break end
+            end
+            if not escaped then allEscaped = false break end
+        end
+        if allEscaped and #Players:GetPlayers() > 0 then
+            State.phase = "Win"
+            return
+        end
+
+        -- Check lose: everyone caught
+        if #State.alive == 0 and #Players:GetPlayers() > 0 then
+            State.phase = "Lose"
+            return
+        end
+    end
+
+    -- Time ran out
+    State.phase = "Lose"
+end
+
+-- ─────────────────────────────────────────────
+-- END SCREEN
+-- ─────────────────────────────────────────────
+local function runEndScreen()
+    local isWin = (State.phase == "Win")
+    broadcastState(isWin and "Win" or "Lose", Config.END_SCREEN_DURATION)
+    print("[GameManager] Round ended — " .. (isWin and "ESCAPED" or "CAUGHT"))
+
+    -- Award coins via PlayerManager (BindableEvent)
+    local awardEvent = ReplicatedStorage:FindFirstChild("AwardEndCoins")
+    if awardEvent then
+        awardEvent:Fire(isWin, State.escaped)
+    end
+
+    task.wait(Config.END_SCREEN_DURATION)
+end
+
+-- ─────────────────────────────────────────────
+-- CATCH / ESCAPE HOOKS (called by other scripts)
+-- ─────────────────────────────────────────────
+
+-- Called by MonsterAI when it catches a player
+local catchEvent = Instance.new("BindableEvent")
+catchEvent.Name  = "PlayerCaughtInternal"
+catchEvent.Parent = ReplicatedStorage
+
+catchEvent.Event:Connect(function(player)
+    -- Remove from alive
+    for i, p in pairs(State.alive) do
+        if p == player then table.remove(State.alive, i) break end
+    end
+    table.insert(State.caught, player.Name)
+    PlayerCaught:FireAllClients(player.Name)
+
+    -- Respawn player as ghost (can still watch and walk but can't interact)
+    task.delay(Config.CAUGHT_RESPAWN_TIME, function()
+        if player and player.Parent then
+            player:LoadCharacter()
+            resetPlayer(player)
+            local ghost = player.Character
+            if ghost then
+                local hum = ghost:FindFirstChild("Humanoid")
+                if hum then hum.WalkSpeed = 12 end
+                -- Make ghost semi-transparent
+                for _, part in pairs(ghost:GetDescendants()) do
+                    if part:IsA("BasePart") then
+                        part.Transparency = 0.6
+                        part.CanCollide = false
+                    end
+                end
+            end
+        end
+    end)
+end)
+
+-- Called by ExitDoor when a player touches it
+local escapeEvent = Instance.new("BindableEvent")
+escapeEvent.Name  = "PlayerEscapedInternal"
+escapeEvent.Parent = ReplicatedStorage
+
+escapeEvent.Event:Connect(function(player)
+    -- Only count if exit is unlocked
+    if not State.exitUnlocked then return end
+    table.insert(State.escaped, player.Name)
+    -- Remove from alive
+    for i, p in pairs(State.alive) do
+        if p == player then table.remove(State.alive, i) break end
+    end
+    PlayerEscaped:FireAllClients(player.Name)
+    print("[GameManager] " .. player.Name .. " escaped!")
+    -- Teleport to safe room
+    local safe = workspace:FindFirstChild("SafeRoom", true)
+    local char  = player.Character
+    if safe and char and char:FindFirstChild("HumanoidRootPart") then
+        char.HumanoidRootPart.CFrame = safe.CFrame + Vector3.new(0, 3, 0)
+    end
+end)
+
+-- Called by ObjectiveManager when all objectives complete
+local objDoneEvent = Instance.new("BindableEvent")
+objDoneEvent.Name  = "AllObjectivesComplete"
+objDoneEvent.Parent = ReplicatedStorage
+
+objDoneEvent.Event:Connect(function()
+    State.exitUnlocked = true
+    State.objectivesDone = Config.OBJECTIVES_REQUIRED
+    print("[GameManager] All objectives done! Exit is now unlocked.")
+    -- Unlock the exit door model
+    local exitDoor = workspace:FindFirstChild("ExitDoor", true)
+    if exitDoor then
+        local door = exitDoor:FindFirstChild("Door")
+        if door then
+            door.Anchored = false
+            door.CanCollide = false
+            door.Transparency = 0.8
+        end
+        local light = exitDoor:FindFirstChild("ExitLight")
+        if light and light:FindFirstChild("PointLight") then
+            light.PointLight.Color = Color3.fromRGB(0, 255, 100)
+        end
+    end
+end)
+
+-- ─────────────────────────────────────────────
+-- MAIN LOOP
+-- ─────────────────────────────────────────────
+while true do
+    runLobby()
+    runGame()
+    runEndScreen()
+end
